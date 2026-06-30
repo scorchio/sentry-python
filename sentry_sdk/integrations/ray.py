@@ -60,6 +60,178 @@ def _insert_sentry_tracing_in_signature(func: "Callable[..., Any]") -> None:
     func.__signature__ = signature.replace(parameters=params)  # type: ignore[attr-defined]
 
 
+def _wrap_actor_init(method: "Callable[..., Any]") -> "Callable[..., Any]":
+    # Wraps an actor __init__ for error capture only.
+    # Ray calls __init__ directly during actor creation, not via _actor_method_call,
+    # so there is no mechanism to propagate trace context. We only capture exceptions.
+    @functools.wraps(method)
+    def new_init(self: "Any", *args: "Any", **kwargs: "Any") -> None:
+        _check_sentry_initialized()
+        try:
+            method(self, *args, **kwargs)
+        except Exception:
+            exc_info = sys.exc_info()
+            _capture_exception(exc_info)
+            reraise(*exc_info)
+
+    return new_init
+
+
+def _wrap_actor_method(
+    method: "Callable[..., Any]", class_name: str, method_name: str
+) -> "Callable[..., Any]":
+    # Wraps a public actor method to continue a distributed trace and create an
+    # execution span/transaction on the worker side. Accepts _sentry_tracing as
+    # a keyword-only arg injected by the caller-side patch.
+    span_name = f"{class_name}.{method_name}"
+
+    @functools.wraps(method)
+    def new_method(
+        self: "Any",
+        *args: "Any",
+        _sentry_tracing: "Optional[dict[str, Any]]" = None,
+        **kwargs: "Any",
+    ) -> "Any":
+        _check_sentry_initialized()
+
+        span_streaming = has_span_streaming_enabled(sentry_sdk.get_client().options)
+        if span_streaming:
+            sentry_sdk.traces.continue_trace(_sentry_tracing or {})
+
+            with sentry_sdk.traces.start_span(
+                name=span_name,
+                attributes={
+                    "sentry.op": OP.QUEUE_TASK_RAY,
+                    "sentry.origin": RayIntegration.origin,
+                    "sentry.span.source": SegmentSource.TASK,
+                },
+                parent_span=None,
+            ):
+                try:
+                    return method(self, *args, **kwargs)
+                except Exception:
+                    exc_info = sys.exc_info()
+                    _capture_exception(exc_info)
+                    reraise(*exc_info)
+        else:
+            transaction = sentry_sdk.continue_trace(
+                _sentry_tracing or {},
+                op=OP.QUEUE_TASK_RAY,
+                name=span_name,
+                origin=RayIntegration.origin,
+                source=TransactionSource.TASK,
+            )
+
+            with sentry_sdk.start_transaction(transaction) as transaction:
+                try:
+                    result = method(self, *args, **kwargs)
+                    transaction.set_status(SPANSTATUS.OK)
+                except Exception:
+                    transaction.set_status(SPANSTATUS.INTERNAL_ERROR)
+                    exc_info = sys.exc_info()
+                    _capture_exception(exc_info)
+                    reraise(*exc_info)
+
+                return result
+
+    # Ray calls inspect.unwrap() before reading actor method signatures, which follows
+    # __wrapped__ (set by functools.wraps) to the original method and loses the
+    # _sentry_tracing parameter. Removing __wrapped__ makes Ray see new_method's actual
+    # signature, which already includes _sentry_tracing as a real keyword-only param.
+    del new_method.__wrapped__
+    return new_method
+
+
+def _patch_actor_class(cls: type) -> None:
+    # Wraps each public method and __init__ of a Ray actor class in-place so that
+    # the wrapped versions are seen by Ray's signature inspection at decoration time.
+    for name, method in inspect.getmembers(cls, predicate=inspect.isfunction):
+        if name == "__init__":
+            setattr(cls, name, _wrap_actor_init(method))
+        elif not name.startswith("_"):
+            setattr(cls, name, _wrap_actor_method(method, cls.__name__, name))
+
+
+def _patch_actor_handle(handle: "Any", class_name: str) -> None:
+    # Patches _actor_method_call on a specific ActorHandle instance so that each
+    # actor method invocation creates a submit span and propagates trace headers.
+    old_actor_method_call = handle._actor_method_call
+
+    def new_actor_method_call(
+        method_name: str,
+        args: "Optional[list[Any]]" = None,
+        kwargs: "Optional[dict[str, Any]]" = None,
+        **opts: "Any",
+    ) -> "Any":
+        span_name = f"{class_name}.{method_name}"
+        kwargs = kwargs or {}
+
+        span_streaming = has_span_streaming_enabled(sentry_sdk.get_client().options)
+        if span_streaming:
+            with sentry_sdk.traces.start_span(
+                name=span_name,
+                attributes={
+                    "sentry.op": OP.QUEUE_SUBMIT_RAY,
+                    "sentry.origin": RayIntegration.origin,
+                },
+            ):
+                tracing = {
+                    k: v
+                    for k, v in sentry_sdk.get_current_scope().iter_trace_propagation_headers()
+                }
+                try:
+                    return old_actor_method_call(
+                        method_name,
+                        args=args,
+                        kwargs={**kwargs, "_sentry_tracing": tracing},
+                        **opts,
+                    )
+                except Exception:
+                    exc_info = sys.exc_info()
+                    _capture_exception(exc_info)
+                    reraise(*exc_info)
+        else:
+            with sentry_sdk.start_span(
+                op=OP.QUEUE_SUBMIT_RAY,
+                name=span_name,
+                origin=RayIntegration.origin,
+            ) as span:
+                tracing = {
+                    k: v
+                    for k, v in sentry_sdk.get_current_scope().iter_trace_propagation_headers()
+                }
+                try:
+                    result = old_actor_method_call(
+                        method_name,
+                        args=args,
+                        kwargs={**kwargs, "_sentry_tracing": tracing},
+                        **opts,
+                    )
+                    span.set_status(SPANSTATUS.OK)
+                except Exception:
+                    span.set_status(SPANSTATUS.INTERNAL_ERROR)
+                    exc_info = sys.exc_info()
+                    _capture_exception(exc_info)
+                    reraise(*exc_info)
+
+                return result
+
+    handle._actor_method_call = new_actor_method_call
+
+
+def _wrap_actor_class_remote(actor_class: "Any", class_name: str) -> None:
+    # Wraps actor_class.remote so each returned ActorHandle is patched for
+    # caller-side tracing via _patch_actor_handle.
+    old_class_remote = actor_class.remote
+
+    def new_class_remote(*args: "Any", **kwargs: "Any") -> "Any":
+        handle = old_class_remote(*args, **kwargs)
+        _patch_actor_handle(handle, class_name)
+        return handle
+
+    actor_class.remote = new_class_remote
+
+
 def _patch_ray_remote() -> None:
     old_remote = remote
 
@@ -68,19 +240,19 @@ def _patch_ray_remote() -> None:
         f: "Optional[Callable[..., Any]]" = None, *args: "Any", **kwargs: "Any"
     ) -> "Callable[..., Any]":
         if inspect.isclass(f):
-            # Ray Actors
-            # (https://docs.ray.io/en/latest/ray-core/actors.html)
-            # are not supported
-            # (Only Ray Tasks are supported)
-            return old_remote(f, *args, **kwargs)
+            # Ray Actors (https://docs.ray.io/en/latest/ray-core/actors.html)
+            _patch_actor_class(f)
+            actor_class = old_remote(f, *args, **kwargs)
+            _wrap_actor_class_remote(actor_class, f.__name__)
+            return actor_class
 
         def wrapper(user_f: "Callable[..., Any]") -> "Any":
             if inspect.isclass(user_f):
-                # Ray Actors
-                # (https://docs.ray.io/en/latest/ray-core/actors.html)
-                # are not supported
-                # (Only Ray Tasks are supported)
-                return old_remote(*args, **kwargs)(user_f)
+                # Ray Actors (https://docs.ray.io/en/latest/ray-core/actors.html)
+                _patch_actor_class(user_f)
+                actor_class = old_remote(*args, **kwargs)(user_f)
+                _wrap_actor_class_remote(actor_class, user_f.__name__)
+                return actor_class
 
             @functools.wraps(user_f)
             def new_func(
