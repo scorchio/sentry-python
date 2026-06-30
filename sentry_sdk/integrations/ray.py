@@ -310,6 +310,16 @@ def _wrap_actor_class_remote(actor_class: "Any", class_name: str) -> None:
     actor_class.remote = new_class_remote
 
 
+def _is_ray_internal_class(cls: type) -> bool:
+    # Ray's own actor infrastructure (ServeController, ProxyActor, etc.) lives in
+    # ray.* modules. These classes are imported by name in worker processes, so
+    # setattr patches applied in the driver never reach the worker — the worker
+    # would see the unpatched method while the driver-side handle still injects
+    # _sentry_tracing, causing TypeError. Skip Ray-internal classes entirely.
+    module = getattr(cls, "__module__", "") or ""
+    return module.startswith("ray.")
+
+
 def _patch_ray_remote() -> None:
     old_remote = remote
 
@@ -319,6 +329,8 @@ def _patch_ray_remote() -> None:
     ) -> "Callable[..., Any]":
         if inspect.isclass(f):
             # Ray Actors (https://docs.ray.io/en/latest/ray-core/actors.html)
+            if _is_ray_internal_class(f):
+                return old_remote(f, *args, **kwargs)
             _patch_actor_class(f)
             actor_class = old_remote(f, *args, **kwargs)
             _wrap_actor_class_remote(actor_class, f.__name__)
@@ -327,6 +339,8 @@ def _patch_ray_remote() -> None:
         def wrapper(user_f: "Callable[..., Any]") -> "Any":
             if inspect.isclass(user_f):
                 # Ray Actors (https://docs.ray.io/en/latest/ray-core/actors.html)
+                if _is_ray_internal_class(user_f):
+                    return old_remote(*args, **kwargs)(user_f)
                 _patch_actor_class(user_f)
                 actor_class = old_remote(*args, **kwargs)(user_f)
                 _wrap_actor_class_remote(actor_class, user_f.__name__)
