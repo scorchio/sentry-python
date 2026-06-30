@@ -66,6 +66,11 @@ def _wrap_actor_init(method: "Callable[..., Any]") -> "Callable[..., Any]":
     # so there is no mechanism to propagate trace context. We only capture exceptions.
     # Async __init__ (used by Ray Serve actors) requires an async wrapper so that
     # Ray can await it correctly in the actor's event loop.
+    #
+    # Note: unlike _wrap_actor_method, we do NOT delete __wrapped__ here.
+    # __init__ does not accept _sentry_tracing as a kwarg (it is never injected by
+    # the caller side), so Ray's inspect.unwrap()-based signature validation is not
+    # a concern for __init__ wrappers.
     if inspect.iscoroutinefunction(method):
 
         @functools.wraps(method)
@@ -223,11 +228,17 @@ def _wrap_actor_method(
 def _patch_actor_class(cls: type) -> None:
     # Wraps each public method and __init__ of a Ray actor class in-place so that
     # the wrapped versions are seen by Ray's signature inspection at decoration time.
-    for name, method in inspect.getmembers(cls, predicate=inspect.isfunction):
+    # Use cls.__dict__ instead of inspect.getmembers to avoid walking the MRO:
+    # inspect.getmembers follows the full inheritance chain, so if a superclass is
+    # also decorated with @ray.remote, its already-wrapped methods would be wrapped
+    # again here, producing nested orphaned transactions in Sentry.
+    for name, attr in cls.__dict__.items():
+        if not inspect.isfunction(attr):
+            continue
         if name == "__init__":
-            setattr(cls, name, _wrap_actor_init(method))
+            setattr(cls, name, _wrap_actor_init(attr))
         elif not name.startswith("_"):
-            setattr(cls, name, _wrap_actor_method(method, cls.__name__, name))
+            setattr(cls, name, _wrap_actor_method(attr, cls.__name__, name))
 
 
 def _patch_actor_handle(handle: "Any", class_name: str) -> None:
@@ -243,6 +254,12 @@ def _patch_actor_handle(handle: "Any", class_name: str) -> None:
     ) -> "Any":
         span_name = f"{class_name}.{method_name}"
         kwargs = kwargs or {}
+
+        # _patch_actor_class only wraps public (non-underscore) methods on the worker
+        # side. Injecting _sentry_tracing into private or dunder method calls would
+        # cause TypeError on the worker. Skip tracing for those calls entirely.
+        if method_name.startswith("_"):
+            return old_actor_method_call(method_name, args=args, kwargs=kwargs, **opts)
 
         span_streaming = has_span_streaming_enabled(sentry_sdk.get_client().options)
         if span_streaming:
@@ -307,6 +324,9 @@ def _wrap_actor_class_remote(actor_class: "Any", class_name: str) -> None:
         _patch_actor_handle(handle, class_name)
         return handle
 
+    # Preserve any attributes Ray attaches to the .remote callable (e.g. __dict__
+    # entries) so callers that access them do not encounter AttributeError.
+    functools.update_wrapper(new_class_remote, old_class_remote)
     actor_class.remote = new_class_remote
 
 
