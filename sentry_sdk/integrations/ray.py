@@ -64,6 +64,22 @@ def _wrap_actor_init(method: "Callable[..., Any]") -> "Callable[..., Any]":
     # Wraps an actor __init__ for error capture only.
     # Ray calls __init__ directly during actor creation, not via _actor_method_call,
     # so there is no mechanism to propagate trace context. We only capture exceptions.
+    # Async __init__ (used by Ray Serve actors) requires an async wrapper so that
+    # Ray can await it correctly in the actor's event loop.
+    if inspect.iscoroutinefunction(method):
+
+        @functools.wraps(method)
+        async def new_init_async(self: "Any", *args: "Any", **kwargs: "Any") -> None:
+            _check_sentry_initialized()
+            try:
+                await method(self, *args, **kwargs)
+            except Exception:
+                exc_info = sys.exc_info()
+                _capture_exception(exc_info)
+                reraise(*exc_info)
+
+        return new_init_async
+
     @functools.wraps(method)
     def new_init(self: "Any", *args: "Any", **kwargs: "Any") -> None:
         _check_sentry_initialized()
@@ -83,7 +99,69 @@ def _wrap_actor_method(
     # Wraps a public actor method to continue a distributed trace and create an
     # execution span/transaction on the worker side. Accepts _sentry_tracing as
     # a keyword-only arg injected by the caller-side patch.
+    # Async methods (used by Ray Serve and async actors) require an async wrapper
+    # so that Ray can await them correctly in the actor's event loop.
+    # Sentry's start_span/start_transaction context managers are synchronous and
+    # can be used with regular `with` inside async functions.
     span_name = f"{class_name}.{method_name}"
+
+    if inspect.iscoroutinefunction(method):
+
+        @functools.wraps(method)
+        async def new_method_async(
+            self: "Any",
+            *args: "Any",
+            _sentry_tracing: "Optional[dict[str, Any]]" = None,
+            **kwargs: "Any",
+        ) -> "Any":
+            _check_sentry_initialized()
+
+            span_streaming = has_span_streaming_enabled(sentry_sdk.get_client().options)
+            if span_streaming:
+                sentry_sdk.traces.continue_trace(_sentry_tracing or {})
+
+                with sentry_sdk.traces.start_span(
+                    name=span_name,
+                    attributes={
+                        "sentry.op": OP.QUEUE_TASK_RAY,
+                        "sentry.origin": RayIntegration.origin,
+                        "sentry.span.source": SegmentSource.TASK,
+                    },
+                    parent_span=None,
+                ):
+                    try:
+                        return await method(self, *args, **kwargs)
+                    except Exception:
+                        exc_info = sys.exc_info()
+                        _capture_exception(exc_info)
+                        reraise(*exc_info)
+            else:
+                transaction = sentry_sdk.continue_trace(
+                    _sentry_tracing or {},
+                    op=OP.QUEUE_TASK_RAY,
+                    name=span_name,
+                    origin=RayIntegration.origin,
+                    source=TransactionSource.TASK,
+                )
+
+                with sentry_sdk.start_transaction(transaction) as transaction:
+                    try:
+                        result = await method(self, *args, **kwargs)
+                        transaction.set_status(SPANSTATUS.OK)
+                    except Exception:
+                        transaction.set_status(SPANSTATUS.INTERNAL_ERROR)
+                        exc_info = sys.exc_info()
+                        _capture_exception(exc_info)
+                        reraise(*exc_info)
+
+                    return result
+
+        # Ray calls inspect.unwrap() before reading actor method signatures, which
+        # follows __wrapped__ (set by functools.wraps) to the original method and
+        # loses the _sentry_tracing parameter. Removing __wrapped__ makes Ray see
+        # new_method_async's actual signature, which includes _sentry_tracing.
+        del new_method_async.__wrapped__
+        return new_method_async
 
     @functools.wraps(method)
     def new_method(
