@@ -5,6 +5,7 @@ import sys
 import sentry_sdk
 from sentry_sdk.consts import OP, SPANSTATUS
 from sentry_sdk.integrations import DidNotEnable, Integration, _check_minimum_version
+from sentry_sdk.integrations.logging import ignore_logger
 from sentry_sdk.traces import SegmentSource
 from sentry_sdk.tracing import TransactionSource
 from sentry_sdk.tracing_utils import has_span_streaming_enabled
@@ -520,5 +521,11 @@ class RayIntegration(Integration):
     def setup_once() -> None:
         version = package_version("ray")
         _check_minimum_version(RayIntegration, version)
+
+        # Ray Serve logs "Request failed." with exc_info for every failed
+        # request; the same exception is already captured via the ASGI
+        # integration, producing duplicate error events. Mirrors what e.g.
+        # the Django integration does for the "django.request" logger.
+        ignore_logger("ray.serve")
 
         _patch_ray_remote()
