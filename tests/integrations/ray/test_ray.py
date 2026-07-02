@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import shutil
 import uuid
@@ -534,3 +535,27 @@ def test_errors_in_ray_actors(span_streaming):
     finally:
         if os.path.exists(ray_temp_dir):
             shutil.rmtree(ray_temp_dir, ignore_errors=True)
+
+
+def test_ray_serve_logger_ignored(sentry_init, capture_events):
+    # RayIntegration.setup_once() only checks the installed `ray` package
+    # version (no live ray cluster needed) and registers "ray.serve" on the
+    # LoggingIntegration's ignore list. So we can exercise this purely
+    # in-process, without starting a ray runtime.
+    sentry_init(integrations=[RayIntegration()])
+    events = capture_events()
+
+    try:
+        1 / 0
+    except ZeroDivisionError:
+        logging.getLogger("ray.serve").exception("Request failed.")
+
+    try:
+        1 / 0
+    except ZeroDivisionError:
+        logging.getLogger("some.other.logger").exception("Request failed.")
+
+    sentry_sdk.flush()
+
+    assert len(events) == 1
+    assert events[0]["logger"] == "some.other.logger"
