@@ -1,4 +1,6 @@
+import inspect
 import json
+import logging
 import os
 import shutil
 import uuid
@@ -8,7 +10,7 @@ import ray
 
 import sentry_sdk
 from sentry_sdk.envelope import Envelope
-from sentry_sdk.integrations.ray import RayIntegration
+from sentry_sdk.integrations.ray import RayIntegration, _is_ray_internal_class
 from sentry_sdk.integrations.stdlib import StdlibIntegration
 from sentry_sdk.traces import SegmentSource
 from tests.conftest import TestTransport
@@ -437,13 +439,36 @@ def test_tracing_in_ray_actors(remote_kwargs, span_streaming):
             for span in item.payload.json["items"]
         ]
 
-        # Spans for submitting the actor task are not created (actors are not supported yet)
-        # Only the manual "example actor execution" span is recorded.
-        assert len(client_spans) == 1
+        # client_spans: [submit span, "ray test parent" span]
+        assert len(client_spans) == 2
 
-        # Transaction are not yet created when executing ray actors (actors are not supported yet)
-        # Only the manual "example actor execution" span is recorded.
-        assert len(worker_spans) == 1
+        submit_span = next(
+            s
+            for s in client_spans
+            if s["attributes"]["sentry.op"]["value"] == "queue.submit.ray"
+        )
+        parent_span = next(s for s in client_spans if s["name"] == "ray test parent")
+        assert submit_span["name"] == "Counter.increment"
+        assert submit_span["attributes"]["sentry.origin"]["value"] == "auto.queue.ray"
+        assert submit_span["parent_span_id"] == parent_span["span_id"]
+        assert submit_span["trace_id"] == parent_span["trace_id"]
+
+        # worker_spans: ["Counter.increment" execution span, manual inner span]
+        assert len(worker_spans) == 2
+
+        exec_span = next(
+            s
+            for s in worker_spans
+            if s["attributes"]["sentry.op"]["value"] == "queue.task.ray"
+        )
+        inner_span = next(
+            s for s in worker_spans if s["name"] == "example actor execution"
+        )
+        assert exec_span["name"] == "Counter.increment"
+        assert exec_span["attributes"]["sentry.origin"]["value"] == "auto.queue.ray"
+        assert exec_span["trace_id"] == parent_span["trace_id"]
+        assert inner_span["parent_span_id"] == exec_span["span_id"]
+        assert inner_span["trace_id"] == exec_span["trace_id"]
     else:
         ray.init(
             runtime_env={
@@ -458,12 +483,33 @@ def test_tracing_in_ray_actors(remote_kwargs, span_streaming):
 
         client_envelope = sentry_sdk.get_client().transport.envelopes[0]
         client_transaction = client_envelope.get_transaction_event()
+        assert client_transaction["transaction"] == "ray test transaction"
 
-        # Spans for submitting the actor task are not created (actors are not supported yet)
-        assert client_transaction["spans"] == []
+        (submit_span,) = client_transaction["spans"]
+        assert submit_span["op"] == "queue.submit.ray"
+        assert submit_span["origin"] == "auto.queue.ray"
+        assert submit_span["description"] == "Counter.increment"
+        assert (
+            submit_span["parent_span_id"]
+            == client_transaction["contexts"]["trace"]["span_id"]
+        )
+        assert (
+            submit_span["trace_id"]
+            == client_transaction["contexts"]["trace"]["trace_id"]
+        )
 
-        # Transaction are not yet created when executing ray actors (actors are not supported yet)
-        assert worker_envelopes == []
+        worker_envelope = worker_envelopes[0]
+        worker_transaction = worker_envelope.get_transaction_event()
+        assert worker_transaction["transaction"] == "Counter.increment"
+        assert worker_transaction["transaction_info"] == {"source": "task"}
+        assert (
+            worker_transaction["contexts"]["trace"]["trace_id"]
+            == client_transaction["contexts"]["trace"]["trace_id"]
+        )
+
+        (inner_span,) = worker_transaction["spans"]
+        assert inner_span["op"] == "task"
+        assert inner_span["description"] == "example actor execution"
 
 
 @pytest.mark.parametrize("span_streaming", [True, False])
@@ -528,9 +574,258 @@ def test_errors_in_ray_actors(span_streaming):
         job_id = future.job_id().hex()
         error = read_error_from_log(job_id, ray_temp_dir)
 
-        # We do not capture errors in ray actors yet
-        assert error is None
+        assert error is not None
+        assert error["level"] == "error"
+        assert error["transaction"] == "Counter.increment"
+        assert error["exception"]["values"][0]["mechanism"]["type"] == "ray"
+        assert not error["exception"]["values"][0]["mechanism"]["handled"]
 
     finally:
         if os.path.exists(ray_temp_dir):
             shutil.rmtree(ray_temp_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("span_streaming", [True, False])
+def test_errors_in_ray_actor_init(span_streaming):
+    sentry_sdk.init(
+        integrations=[RayIntegration()],
+        disabled_integrations=[StdlibIntegration],
+        transport=RayLoggingTransport(),
+        traces_sample_rate=1.0,
+        _experiments={"trace_lifecycle": "stream" if span_streaming else "static"},
+    )
+
+    ray_temp_dir = os.path.join("/tmp", f"ray_test_{uuid.uuid4().hex[:8]}")
+    os.makedirs(ray_temp_dir, exist_ok=True)
+
+    try:
+        ray.init(
+            runtime_env={
+                "worker_process_setup_hook": setup_sentry_with_logging_transport_and_span_streaming
+                if span_streaming
+                else setup_sentry_with_logging_transport,
+                "working_dir": "./",
+            },
+            _temp_dir=ray_temp_dir,
+        )
+
+        @ray.remote
+        class BadActor:
+            def __init__(self):
+                raise RuntimeError("init failed")
+
+            def noop(self):
+                pass
+
+        actor = BadActor.remote()
+        with pytest.raises(Exception):
+            ray.get(actor.noop.remote())
+
+        future = actor.noop.remote()
+        job_id = future.job_id().hex()
+        error = read_error_from_log(job_id, ray_temp_dir)
+
+        assert error is not None
+        assert error["level"] == "error"
+        assert error["exception"]["values"][0]["mechanism"]["type"] == "ray"
+        assert not error["exception"]["values"][0]["mechanism"]["handled"]
+
+    finally:
+        if os.path.exists(ray_temp_dir):
+            shutil.rmtree(ray_temp_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("span_streaming", [True, False])
+def test_tracing_in_async_ray_actors(span_streaming):
+    """Regression: sync wrappers on async actor methods return unawaited coroutines."""
+    sentry_sdk.init(
+        integrations=[RayIntegration()],
+        disabled_integrations=[StdlibIntegration],
+        transport=RayTestTransport(),
+        traces_sample_rate=1.0,
+        _experiments={"trace_lifecycle": "stream" if span_streaming else "static"},
+    )
+
+    @ray.remote
+    class AsyncCounter:
+        async def __init__(self):
+            self.n = 0
+
+        async def increment(self):
+            if span_streaming:
+                with sentry_sdk.traces.start_span(
+                    name="example async actor execution",
+                    attributes={"sentry.op": "task"},
+                ):
+                    self.n += 1
+            else:
+                with sentry_sdk.start_span(
+                    op="task", name="example async actor execution"
+                ):
+                    self.n += 1
+
+                return sentry_sdk.get_client().transport.envelopes
+
+    if span_streaming:
+        ray_temp_dir = os.path.join("/tmp", f"ray_test_{uuid.uuid4().hex[:8]}")
+        os.makedirs(ray_temp_dir, exist_ok=True)
+
+        try:
+            ray.init(
+                runtime_env={
+                    "worker_process_setup_hook": setup_sentry_with_logging_transport_and_span_streaming,
+                    "working_dir": "./",
+                },
+                _temp_dir=ray_temp_dir,
+            )
+
+            with sentry_sdk.traces.start_span(
+                name="ray test parent", attributes={"sentry.op": "task"}
+            ):
+                counter = AsyncCounter.remote()
+                future = counter.increment.remote()
+                ray.get(future)
+
+            job_id = future.job_id().hex()
+            worker_spans = read_spans_from_log(job_id, ray_temp_dir)
+        finally:
+            if os.path.exists(ray_temp_dir):
+                shutil.rmtree(ray_temp_dir, ignore_errors=True)
+
+        sentry_sdk.flush()
+        client_envelope = sentry_sdk.get_client().transport.envelopes[0]
+        client_spans = [
+            span
+            for item in client_envelope.items
+            for span in item.payload.json["items"]
+        ]
+
+        assert len(client_spans) == 2
+
+        submit_span = next(
+            s
+            for s in client_spans
+            if s["attributes"]["sentry.op"]["value"] == "queue.submit.ray"
+        )
+        parent_span = next(s for s in client_spans if s["name"] == "ray test parent")
+        assert submit_span["name"] == "AsyncCounter.increment"
+        assert submit_span["attributes"]["sentry.origin"]["value"] == "auto.queue.ray"
+        assert submit_span["parent_span_id"] == parent_span["span_id"]
+        assert submit_span["trace_id"] == parent_span["trace_id"]
+
+        assert len(worker_spans) == 2
+
+        exec_span = next(
+            s
+            for s in worker_spans
+            if s["attributes"]["sentry.op"]["value"] == "queue.task.ray"
+        )
+        inner_span = next(
+            s for s in worker_spans if s["name"] == "example async actor execution"
+        )
+        assert exec_span["name"] == "AsyncCounter.increment"
+        assert exec_span["trace_id"] == parent_span["trace_id"]
+        assert inner_span["parent_span_id"] == exec_span["span_id"]
+        assert inner_span["trace_id"] == exec_span["trace_id"]
+    else:
+        ray.init(
+            runtime_env={
+                "worker_process_setup_hook": setup_sentry,
+                "working_dir": "./",
+            }
+        )
+
+        with sentry_sdk.start_transaction(op="task", name="ray test transaction"):
+            counter = AsyncCounter.remote()
+            worker_envelopes = ray.get(counter.increment.remote())
+
+        client_envelope = sentry_sdk.get_client().transport.envelopes[0]
+        client_transaction = client_envelope.get_transaction_event()
+        assert client_transaction["transaction"] == "ray test transaction"
+
+        (submit_span,) = client_transaction["spans"]
+        assert submit_span["op"] == "queue.submit.ray"
+        assert submit_span["origin"] == "auto.queue.ray"
+        assert submit_span["description"] == "AsyncCounter.increment"
+        assert (
+            submit_span["parent_span_id"]
+            == client_transaction["contexts"]["trace"]["span_id"]
+        )
+        assert (
+            submit_span["trace_id"]
+            == client_transaction["contexts"]["trace"]["trace_id"]
+        )
+
+        worker_envelope = worker_envelopes[0]
+        worker_transaction = worker_envelope.get_transaction_event()
+        assert worker_transaction["transaction"] == "AsyncCounter.increment"
+        assert worker_transaction["transaction_info"] == {"source": "task"}
+        assert (
+            worker_transaction["contexts"]["trace"]["trace_id"]
+            == client_transaction["contexts"]["trace"]["trace_id"]
+        )
+
+        (inner_span,) = worker_transaction["spans"]
+        assert inner_span["op"] == "task"
+        assert inner_span["description"] == "example async actor execution"
+
+
+def test_ray_internal_actors_not_patched():
+    """Regression: Ray-internal classes must not be patched.
+
+    Workers import ray.* classes by module name, so driver-side setattr patches
+    never reach them. Patching injects _sentry_tracing into handle calls but the
+    worker method has no such param → TypeError.
+    """
+
+    # _is_ray_internal_class must identify ray.* modules
+    class FakeRayActor:
+        def get_proxies(self):
+            pass
+
+    FakeRayActor.__module__ = "ray.serve._private.controller"
+    assert _is_ray_internal_class(FakeRayActor)
+
+    class UserActor:
+        def work(self):
+            pass
+
+    assert not _is_ray_internal_class(UserActor)
+
+    # After ray.remote on a fake Ray-internal class, method must NOT gain _sentry_tracing
+    sentry_sdk.init(
+        integrations=[RayIntegration()],
+        transport=RayTestTransport(),
+        traces_sample_rate=1.0,
+    )
+    ray.init()
+
+    FakeRayActor.__module__ = "ray.serve._private.controller"
+    ray.remote(FakeRayActor)
+
+    sig = inspect.signature(FakeRayActor.get_proxies)
+    assert "_sentry_tracing" not in sig.parameters
+
+
+def test_ray_serve_logger_ignored(sentry_init, capture_events):
+    # RayIntegration.setup_once() only checks the installed `ray` package
+    # version (no live ray cluster needed) and registers "ray.serve" on the
+    # LoggingIntegration's ignore list. So we can exercise this purely
+    # in-process, without starting a ray runtime.
+    sentry_init(integrations=[RayIntegration()])
+    events = capture_events()
+
+    try:
+        1 / 0
+    except ZeroDivisionError:
+        logging.getLogger("ray.serve").exception("Request failed.")
+
+    try:
+        1 / 0
+    except ZeroDivisionError:
+        logging.getLogger("some.other.logger").exception("Request failed.")
+
+    sentry_sdk.flush()
+
+    assert len(events) == 1
+    assert events[0]["logger"] == "some.other.logger"
